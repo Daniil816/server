@@ -1,0 +1,874 @@
+import os
+import pickle
+import vk_api
+import time
+import gspread
+import json
+from vk_api.longpoll import VkLongPoll, VkEventType
+from google.auth.transport.requests import Request
+from google_auth_oauthlib.flow import InstalledAppFlow
+
+# --- КОНФИГУРАЦИЯ ---
+VK_TOKEN = 'vk1.a.hnuRWe9zj3RAiXc-2Jhi3ix1wDAYPeA3vv5EuURXKIptRpDR8G948Q891ndVNMuOnz69LxbvAbXQVACkIlLuhQidngypMtSGg4Sv6keay8XH-0WZOs9_L9m4LmXcV3F8pg3dyOTiujoSmzTqi9j2g5j_txPUcKILy_kbavL40GLZ_qLhzbuQjBI_PokDT1cExggdvo2CSgUOsdZBkFayLQ'
+SPREADSHEET_NAME = '29 | Работа'
+RIGHTS_FILE = 'user_rights.json'
+
+# СУПЕРАДМИНЫ - нельзя отозвать права
+SUPER_ADMINS = [807253464, 679050151]  # Главные админы
+
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+
+user_rights = {}
+
+def load_user_rights():
+    """Загружает права пользователей из файла"""
+    global user_rights
+    if os.path.exists(RIGHTS_FILE):
+        try:
+            with open(RIGHTS_FILE, 'r', encoding='utf-8') as f:
+                user_rights = json.load(f)
+                user_rights = {int(k): v for k, v in user_rights.items()}
+        except Exception as e:
+            print(f"Ошибка загрузки прав: {e}")
+            user_rights = {}
+    else:
+        user_rights = {}
+    
+    # Автоматически добавляем суперадминов, если их нет в файле
+    for super_admin_id in SUPER_ADMINS:
+        if super_admin_id not in user_rights:
+            user_rights[super_admin_id] = {
+                'role': 'super_admin',
+                'permissions': ['add_admin', 'add_editor', 'edit_table', 'grant_access', 'revoke_super'],
+                'is_super': True,
+                'added_by': 'system',
+                'added_date': time.strftime("%d.%m.%Y %H:%M:%S")
+            }
+    
+    save_user_rights()
+
+def save_user_rights():
+    """Сохраняет права пользователей в файл"""
+    try:
+        with open(RIGHTS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(user_rights, f, ensure_ascii=False, indent=2)
+        print("Права пользователей сохранены")
+    except Exception as e:
+        print(f"Ошибка сохранения прав: {e}")
+
+def get_user_role(user_id):
+    """Возвращает роль пользователя"""
+    if user_id in user_rights:
+        return user_rights[user_id].get('role', 'user')
+    return 'user'
+
+def is_super_admin(user_id):
+    """Проверяет, является ли пользователь суперадмином"""
+    return user_id in SUPER_ADMINS
+
+def has_permission(user_id, permission):
+    """Проверяет, есть ли у пользователя определенное разрешение"""
+    if user_id in user_rights:
+        permissions = user_rights[user_id].get('permissions', [])
+        return permission in permissions
+    return False
+
+def can_revoke_rights(revoker_id, target_id):
+    """Проверяет, может ли пользователь отозвать права у другого"""
+    # Суперадмины могут отзывать права у всех, кроме других суперадминов
+    if is_super_admin(revoker_id):
+        return not is_super_admin(target_id)
+    
+    # Обычные админы могут отзывать права только у редакторов и пользователей
+    if has_permission(revoker_id, 'grant_access'):
+        return not (is_super_admin(target_id) or has_permission(target_id, 'grant_access'))
+    
+    return False
+
+def add_user_rights(user_id, role, permissions, added_by):
+    """Добавляет или обновляет права пользователя"""
+    # Нельзя изменять права суперадминов
+    if is_super_admin(user_id):
+        return False, "Нельзя изменять права суперадмина!"
+    
+    user_rights[user_id] = {
+        'role': role,
+        'permissions': permissions,
+        'added_by': added_by,
+        'added_date': time.strftime("%d.%m.%Y %H:%M:%S"),
+        'is_super': False
+    }
+    save_user_rights()
+    return True, "Права успешно добавлены"
+
+def remove_user_rights(user_id, remover_id):
+    """Удаляет права пользователя"""
+    # Проверяем, можно ли отозвать права
+    if not can_revoke_rights(remover_id, user_id):
+        return False, "У вас нет прав для отзыва прав у этого пользователя!"
+    
+    if user_id in user_rights:
+        # Нельзя удалять суперадминов
+        if user_rights[user_id].get('is_super', False):
+            return False, "Нельзя удалять суперадмина!"
+        
+        role = user_rights[user_id].get('role', 'user')
+        del user_rights[user_id]
+        save_user_rights()
+        return True, f"Права пользователя {user_id} ({role}) успешно отозваны!"
+    return False, "Пользователь не найден"
+
+def get_google_client():
+    """Получение авторизованного клиента Google Sheets"""
+    creds = None
+    if os.path.exists('token.pickle'):
+        with open('token.pickle', 'rb') as token:
+            creds = pickle.load(token)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file('client_secret.json', SCOPES)
+            print("Нужно подтвердить доступ в браузере...")
+            creds = flow.run_local_server(port=8080)
+        with open('token.pickle', 'wb') as token:
+            pickle.dump(creds, token)
+
+    return gspread.authorize(creds)
+
+def set_cell_value(row_data, header_map, header_name, value, sheet_columns):
+    """Устанавливает значение в ячейку"""
+    if header_name in header_map:
+        col_index = header_map[header_name]
+        row_data[col_index] = value
+        return True
+    else:
+        manual_mapping = {
+            'Приоритет': 1,
+            'Nick_Name': 2,
+            'Должность': 3,
+            'VK': 4,
+            'Ссылка на форум': 5,
+            'Дата назначения на 1': 6,
+            'Дата последнего повышения': 11,
+            'Ждет уровень': 12,
+            'Дата повышения': 13,
+            'Разовые': 16,
+            'Длительные': 17,
+            'Пятидесятипроцентные': 18,
+            'Выговоры': 19,
+            'Выговоры б/с': 20,
+            'Предупреждения': 21,
+            'Логи нормы': 22,
+        }
+        
+        if header_name in manual_mapping:
+            col_index = manual_mapping[header_name]
+            if col_index < len(row_data):
+                row_data[col_index] = value
+                return True
+    
+    return False
+
+def add_admin_to_sheet(sheet, headers, header_map, nickname, date_val, vk_link, forum_link):
+    """Добавляет администратора в таблицу"""
+    row_data = [''] * len(headers)
+    
+    formula_m = '=ЕСЛИ(INDIRECT("B"&ROW())=1;"Ждёт 2 уровень";ЕСЛИ(INDIRECT("B"&ROW())=2;"Ждёт 3 уровень";ЕСЛИ(INDIRECT("B"&ROW())=3;"Ждёт 4 уровень";ЕСЛИ(INDIRECT("B"&ROW())=4;"Ждёт 5 уровень";ЕСЛИ(INDIRECT("B"&ROW())=5;"Спец. Следящий";"Не распознал уровень")))))'
+    formula_n = '=ЕСЛИ(INDIRECT("M"&ROW())="Ждёт 2 уровень";INDIRECT("L"&ROW())+7;ЕСЛИ(INDIRECT("M"&ROW())="Ждёт 3 уровень";INDIRECT("L"&ROW())+31;ЕСЛИ(INDIRECT("M"&ROW())="Ждёт 4 уровень";INDIRECT("L"&ROW())+60;ЕСЛИ(INDIRECT("M"&ROW())="Ждёт 5 уровень";"По доверию";ЕСЛИ(INDIRECT("M"&ROW())="Спец. Следящий";"Неизвестно";"Не удалось распознать статус")))))'
+    
+    row_data[0] = ""
+    
+    # Заполняем данные
+    set_cell_value(row_data, header_map, 'Приоритет', '1', headers)
+    set_cell_value(row_data, header_map, 'Nick_Name', nickname, headers)
+    set_cell_value(row_data, header_map, 'Должность', 'Администратор', headers)
+    set_cell_value(row_data, header_map, 'VK', vk_link, headers)
+    
+    forum_cell = f'=HYPERLINK("{forum_link}"; "LINK")'
+    set_cell_value(row_data, header_map, 'Ссылка на форум', forum_cell, headers)
+    
+    set_cell_value(row_data, header_map, 'Дата назначения на 1', date_val, headers)
+    set_cell_value(row_data, header_map, 'Дата последнего повышения', date_val, headers)
+    set_cell_value(row_data, header_map, 'Ждет уровень', formula_m, headers)
+    set_cell_value(row_data, header_map, 'Дата повышения', formula_n, headers)
+    
+    set_cell_value(row_data, header_map, 'Разовые', "Разовые [0/3]", headers)
+    set_cell_value(row_data, header_map, 'Длительные', "Длительные [0/1]", headers)
+    set_cell_value(row_data, header_map, 'Пятидесятипроцентные', "Пятидесятипроцентный [0/2]", headers)
+    set_cell_value(row_data, header_map, 'Выговоры', "Выговоры [0/3]", headers)
+    set_cell_value(row_data, header_map, 'Выговоры б/с', "Из них выговоры б/с [0]", headers)
+    set_cell_value(row_data, header_map, 'Предупреждения', "Предупреждения [0/3]", headers)
+    set_cell_value(row_data, header_map, 'Логи нормы', "Логи нормы [0/3]", headers)
+    
+    # Добавляем строку в таблицу
+    sheet.append_row(values=row_data, value_input_option='USER_ENTERED')
+    
+    return True
+
+def edit_cell_in_sheet(sheet, row_number, column_name, new_value, header_map):
+    """Редактирует ячейку в таблице"""
+    try:
+        if column_name in header_map:
+            col_index = header_map[column_name] + 1  # +1 т.к. gspread использует 1-based индексы
+            
+            # Проверяем, существует ли строка
+            if row_number <= len(sheet.get_all_values()):
+                sheet.update_cell(row_number, col_index, new_value)
+                return True, f"Ячейка ({row_number}, {column_name}) обновлена на '{new_value}'"
+            else:
+                return False, f"Строка {row_number} не существует"
+        else:
+            return False, f"Столбец '{column_name}' не найден"
+    except Exception as e:
+        return False, f"Ошибка: {str(e)}"
+
+def edit_admin_in_sheet(sheet, headers, header_map, nickname, field_to_edit, new_value):
+    """Редактирует данные существующего администратора"""
+    try:
+        # Ищем строку с нужным ником
+        all_values = sheet.get_all_values()
+        nick_column_index = header_map.get('Nick_Name', 2)  # По умолчанию столбец C
+        
+        found_row = None
+        for i, row in enumerate(all_values):
+            if i > 0 and len(row) > nick_column_index:  # Пропускаем заголовки
+                if row[nick_column_index].strip() == nickname:
+                    found_row = i + 1  # +1 т.к. gspread использует 1-based индексы
+                    break
+        
+        if not found_row:
+            return False, f"Администратор с ником '{nickname}' не найден"
+        
+        # Редактируем нужное поле
+        if field_to_edit in header_map:
+            col_index = header_map[field_to_edit] + 1
+            sheet.update_cell(found_row, col_index, new_value)
+            return True, f"Поле '{field_to_edit}' для администратора '{nickname}' обновлено на '{new_value}'"
+        else:
+            return False, f"Поле '{field_to_edit}' не найдено в таблице"
+            
+    except Exception as e:
+        return False, f"Ошибка: {str(e)}"
+
+def delete_admin_from_sheet(sheet, headers, header_map, nickname):
+    """Удаляет администратора из таблицы"""
+    try:
+        # Ищем строку с нужным ником
+        all_values = sheet.get_all_values()
+        nick_column_index = header_map.get('Nick_Name', 2)
+        
+        found_row = None
+        for i, row in enumerate(all_values):
+            if i > 0 and len(row) > nick_column_index:
+                if row[nick_column_index].strip() == nickname:
+                    found_row = i + 1
+                    break
+        
+        if not found_row:
+            return False, f"Администратор с ником '{nickname}' не найден"
+        
+        # Удаляем строку
+        sheet.delete_rows(found_row)
+        return True, f"Администратор '{nickname}' удален из таблицы"
+            
+    except Exception as e:
+        return False, f"Ошибка: {str(e)}"
+
+def search_admin_in_sheet(sheet, headers, header_map, search_term):
+    """Ищет администратора в таблице"""
+    try:
+        all_values = sheet.get_all_values()
+        
+        # Определяем, по какому полю ищем
+        search_fields = ['Nick_Name', 'VK', 'Должность']
+        
+        results = []
+        for i, row in enumerate(all_values):
+            if i == 0:  # Пропускаем заголовки
+                continue
+            
+            for field in search_fields:
+                if field in header_map:
+                    col_index = header_map[field]
+                    if col_index < len(row):
+                        cell_value = row[col_index]
+                        if search_term.lower() in cell_value.lower():
+                            # Формируем информацию о найденном администраторе
+                            admin_info = f"Строка {i+1}:\n"
+                            
+                            # Добавляем основные поля
+                            if 'Nick_Name' in header_map and header_map['Nick_Name'] < len(row):
+                                admin_info += f"Ник: {row[header_map['Nick_Name']]}\n"
+                            if 'Должность' in header_map and header_map['Должность'] < len(row):
+                                admin_info += f"Должность: {row[header_map['Должность']]}\n"
+                            if 'VK' in header_map and header_map['VK'] < len(row):
+                                admin_info += f"VK: {row[header_map['VK']]}\n"
+                            if 'Дата назначения на 1' in header_map and header_map['Дата назначения на 1'] < len(row):
+                                admin_info += f"Дата назначения: {row[header_map['Дата назначения на 1']]}\n"
+                            
+                            results.append(admin_info)
+                            break  # Не добавляем одну строку несколько раз
+        
+        if results:
+            return True, "Найдены администраторы:\n\n" + "\n---\n".join(results[:10])  # Ограничиваем 10 результатами
+        else:
+            return False, f"Администраторы по запросу '{search_term}' не найдены"
+            
+    except Exception as e:
+        return False, f"Ошибка поиска: {str(e)}"
+
+def get_admin_stats(sheet, headers, header_map):
+    """Получает статистику по администраторам"""
+    try:
+        all_values = sheet.get_all_values()
+        if len(all_values) <= 1:
+            return True, "В таблице нет данных об администраторах"
+        
+        # Считаем количество администраторов
+        total_admins = len(all_values) - 1  # Минус заголовок
+        
+        # Считаем по должностям
+        positions = {}
+        if 'Должность' in header_map:
+            position_index = header_map['Должность']
+            for i, row in enumerate(all_values):
+                if i > 0 and len(row) > position_index:
+                    position = row[position_index].strip()
+                    if position:
+                        positions[position] = positions.get(position, 0) + 1
+        
+        # Формируем статистику
+        stats = f"📊 Статистика администраторов:\n\n"
+        stats += f"Всего администраторов: {total_admins}\n\n"
+        
+        if positions:
+            stats += "По должностям:\n"
+            for position, count in positions.items():
+                stats += f"• {position}: {count}\n"
+        
+        return True, stats
+            
+    except Exception as e:
+        return False, f"Ошибка получения статистики: {str(e)}"
+
+def main():
+    print("--- ЗАПУСК СИСТЕМЫ УПРАВЛЕНИЯ ПРАВАМИ ---")
+    print(f"Суперадмины: {SUPER_ADMINS}")
+    
+    load_user_rights()
+    print(f"Загружено прав для {len(user_rights)} пользователей")
+    
+    print("\nТекущие пользователи с правами:")
+    for user_id, rights in user_rights.items():
+        role = rights.get('role', 'user')
+        is_super = rights.get('is_super', False)
+        super_mark = " [СУПЕР]" if is_super else ""
+        print(f"  ID: {user_id}, Роль: {role}{super_mark}")
+
+    try:
+        gc = get_google_client()
+        sheet = gc.open(SPREADSHEET_NAME).sheet1
+        print(f"\n✓ Подключено к таблице: {SPREADSHEET_NAME}")
+
+        headers = sheet.get_all_values()[0]
+        header_map = {header: index for index, header in enumerate(headers)}
+        
+        print("\nЗаголовки таблицы:")
+        for header, index in header_map.items():
+            print(f"  {index}: '{header}'")
+
+        vk_session = vk_api.VkApi(token=VK_TOKEN)
+        vk = vk_session.get_api()
+        longpoll = VkLongPoll(vk_session)
+        print("\n✓ Бот ВК запущен и ждет сообщений...")
+
+        for event in longpoll.listen():
+            if event.type == VkEventType.MESSAGE_NEW:
+                user_id = event.user_id
+                text = event.text.strip()
+                
+                if hasattr(event, 'from_chat') and event.from_chat:
+                    chat_id = event.chat_id
+                    print(f"Чат {chat_id}: сообщение от {user_id}: {text}")
+                else:
+                    print(f"ЛС от {user_id}: {text}")
+
+                # Команда для выдачи прав
+                if text.startswith('/grant'):
+                    if not has_permission(user_id, 'grant_access'):
+                        vk.messages.send(
+                            user_id=user_id,
+                            message="❌ У вас нет прав для выдачи доступа!",
+                            random_id=0
+                        )
+                        continue
+                    
+                    parts = text.split()
+                    if len(parts) < 4:
+                        vk.messages.send(
+                            user_id=user_id,
+                            message="❌ Формат: /grant [VK_ID] [роль] [уровень]\n"
+                                    "Роли: editor (редактор), admin (администратор)\n"
+                                    "Примеры:\n"
+                                    "/grant 123456789 editor - выдать права редактора\n"
+                                    "/grant 987654321 admin - выдать права администратора",
+                            random_id=0
+                        )
+                        continue
+                    
+                    try:
+                        target_user = int(parts[1])
+                        role = parts[2].lower()
+                        
+                        # Проверяем, не пытаемся ли изменить суперадмина
+                        if is_super_admin(target_user):
+                            vk.messages.send(
+                                user_id=user_id,
+                                message="❌ Нельзя изменять права суперадмина!",
+                                random_id=0
+                            )
+                            continue
+                        
+                        if role == 'editor':
+                            permissions = ['edit_table']
+                            role_name = "редактор"
+                        elif role == 'admin':
+                            permissions = ['add_admin', 'add_editor', 'edit_table', 'grant_access']
+                            role_name = "администратор"
+                        else:
+                            vk.messages.send(
+                                user_id=user_id,
+                                message="❌ Неверная роль. Допустимые значения: editor, admin",
+                                random_id=0
+                            )
+                            continue
+                        
+                        success, message = add_user_rights(target_user, role, permissions, user_id)
+                        
+                        if success:
+                            # Уведомляем пользователя, которому выдали права
+                            try:
+                                vk.messages.send(
+                                    user_id=target_user,
+                                    message=f"🎉 Вам были выданы права {role_name}!\n"
+                                            f"Теперь вы можете использовать команды бота.",
+                                    random_id=0
+                                )
+                            except:
+                                pass
+                            
+                            vk.messages.send(
+                                user_id=user_id,
+                                message=f"✅ Пользователю {target_user} выданы права {role_name}!\n"
+                                        f"Доступные разрешения: {', '.join(permissions)}",
+                                random_id=0
+                            )
+                            print(f"Пользователю {target_user} выданы права {role_name} пользователем {user_id}")
+                        else:
+                            vk.messages.send(
+                                user_id=user_id,
+                                message=f"❌ {message}",
+                                random_id=0
+                            )
+                        
+                    except ValueError:
+                        vk.messages.send(
+                            user_id=user_id,
+                            message="❌ Неверный формат VK ID. Должен быть числом.",
+                            random_id=0
+                        )
+
+                # Команда для отзыва прав
+                elif text.startswith('/revoke'):
+                    if not has_permission(user_id, 'grant_access'):
+                        vk.messages.send(
+                            user_id=user_id,
+                            message="❌ У вас нет прав для отзыва доступа!",
+                            random_id=0
+                        )
+                        continue
+                    
+                    parts = text.split()
+                    if len(parts) < 2:
+                        vk.messages.send(
+                            user_id=user_id,
+                            message="❌ Формат: /revoke [VK_ID]\n"
+                                    "Пример: /revoke 123456789",
+                            random_id=0
+                        )
+                        continue
+                    
+                    try:
+                        target_user = int(parts[1])
+                        
+                        if target_user not in user_rights:
+                            vk.messages.send(
+                                user_id=user_id,
+                                message=f"⚠️ Пользователь {target_user} не имеет прав.",
+                                random_id=0
+                            )
+                            continue
+                        
+                        success, message = remove_user_rights(target_user, user_id)
+                        
+                        vk.messages.send(
+                            user_id=user_id,
+                            message=f"{'✅' if success else '❌'} {message}",
+                            random_id=0
+                        )
+                        
+                        if success:
+                            print(f"Права пользователя {target_user} отозваны пользователем {user_id}")
+                        
+                    except ValueError:
+                        vk.messages.send(
+                            user_id=user_id,
+                            message="❌ Неверный формат VK ID.",
+                            random_id=0
+                        )
+
+                # Команда для добавления администратора
+                elif text.startswith('/addadmin'):
+                    if not has_permission(user_id, 'add_admin'):
+                        vk.messages.send(
+                            user_id=user_id,
+                            message="❌ У вас нет прав для добавления администраторов!",
+                            random_id=0
+                        )
+                        continue
+                    
+                    parts = text.split()
+                    if len(parts) < 5:
+                        vk.messages.send(
+                            user_id=user_id,
+                            message="❌ Формат: /addadmin [Ник] [Дата] [ВК] [Форум]\n"
+                                    "Пример: /addadmin Vasya 01.01.2024 https://vk.com/id123 https://forum.link",
+                            random_id=0
+                        )
+                        continue
+
+                    nickname = parts[1]
+                    date_val = parts[2]
+                    vk_link = parts[3]
+                    forum_link = parts[4]
+                    
+                    try:
+                        success = add_admin_to_sheet(sheet, headers, header_map, nickname, date_val, vk_link, forum_link)
+                        if success:
+                            vk.messages.send(
+                                user_id=user_id,
+                                message=f"✅ Администратор {nickname} успешно добавлен в таблицу!",
+                                random_id=0
+                            )
+                            print(f"Администратор {nickname} добавлен пользователем {user_id}")
+                        else:
+                            vk.messages.send(
+                                user_id=user_id,
+                                message="❌ Ошибка при добавлении в таблицу.",
+                                random_id=0
+                            )
+                    except Exception as e:
+                        vk.messages.send(
+                            user_id=user_id,
+                            message=f"❌ Ошибка: {str(e)}",
+                            random_id=0
+                        )
+
+                # Команда для редактирования таблицы
+                elif text.startswith('/edit'):
+                    if not has_permission(user_id, 'edit_table'):
+                        vk.messages.send(
+                            user_id=user_id,
+                            message="❌ У вас нет прав для редактирования таблицы!",
+                            random_id=0
+                        )
+                        continue
+                    
+                    parts = text.split(maxsplit=3)
+                    if len(parts) < 4:
+                        vk.messages.send(
+                            user_id=user_id,
+                            message="❌ Формат: /edit [строка] [столбец] [новое_значение]\n"
+                                    "Или: /edit [ник] [поле] [новое_значение] для редактирования по нику\n"
+                                    "Примеры:\n"
+                                    "/edit 5 Nick_Name НовоеИмя\n"
+                                    "/edit Vasya Должность Модератор\n"
+                                    "Доступные столбцы: Приоритет, Nick_Name, Должность, VK и др.",
+                            random_id=0
+                        )
+                        continue
+                    
+                    try:
+                        # Пытаемся понять, это номер строки или ник
+                        try:
+                            row_num = int(parts[1])
+                            column_name = parts[2]
+                            new_value = parts[3]
+                            
+                            # Если успешно преобразовали в число, значит это номер строки
+                            success, message = edit_cell_in_sheet(sheet, row_num, column_name, new_value, header_map)
+                            
+                        except ValueError:
+                            # Если не получилось преобразовать в число, значит это ник
+                            nickname = parts[1]
+                            field_to_edit = parts[2]
+                            new_value = parts[3]
+                            
+                            success, message = edit_admin_in_sheet(sheet, headers, header_map, nickname, field_to_edit, new_value)
+                        
+                        vk.messages.send(
+                            user_id=user_id,
+                            message=f"{'✅' if success else '❌'} {message}",
+                            random_id=0
+                        )
+                        
+                    except ValueError:
+                        vk.messages.send(
+                            user_id=user_id,
+                            message="❌ Неверный формат.",
+                            random_id=0
+                        )
+                    except Exception as e:
+                        vk.messages.send(
+                            user_id=user_id,
+                            message=f"❌ Ошибка: {str(e)}",
+                            random_id=0
+                        )
+
+                # Команда для удаления администратора
+                elif text.startswith('/deleteadmin'):
+                    if not has_permission(user_id, 'add_admin'):
+                        vk.messages.send(
+                            user_id=user_id,
+                            message="❌ У вас нет прав для удаления администраторов!",
+                            random_id=0
+                        )
+                        continue
+                    
+                    parts = text.split()
+                    if len(parts) < 2:
+                        vk.messages.send(
+                            user_id=user_id,
+                            message="❌ Формат: /deleteadmin [Ник]\n"
+                                    "Пример: /deleteadmin Vasya",
+                            random_id=0
+                        )
+                        continue
+                    
+                    nickname = parts[1]
+                    
+                    try:
+                        success, message = delete_admin_from_sheet(sheet, headers, header_map, nickname)
+                        
+                        vk.messages.send(
+                            user_id=user_id,
+                            message=f"{'✅' if success else '❌'} {message}",
+                            random_id=0
+                        )
+                        
+                    except Exception as e:
+                        vk.messages.send(
+                            user_id=user_id,
+                            message=f"❌ Ошибка: {str(e)}",
+                            random_id=0
+                        )
+
+                # Команда для поиска администратора
+                elif text.startswith('/search'):
+                    if not has_permission(user_id, 'edit_table'):
+                        vk.messages.send(
+                            user_id=user_id,
+                            message="❌ У вас нет прав для поиска!",
+                            random_id=0
+                        )
+                        continue
+                    
+                    parts = text.split(maxsplit=1)
+                    if len(parts) < 2:
+                        vk.messages.send(
+                            user_id=user_id,
+                            message="❌ Формат: /search [запрос]\n"
+                                    "Пример: /search Vasya\n"
+                                    "Ищет по нику, VK ссылке и должности",
+                            random_id=0
+                        )
+                        continue
+                    
+                    search_term = parts[1]
+                    
+                    try:
+                        success, message = search_admin_in_sheet(sheet, headers, header_map, search_term)
+                        
+                        vk.messages.send(
+                            user_id=user_id,
+                            message=message,
+                            random_id=0
+                        )
+                        
+                    except Exception as e:
+                        vk.messages.send(
+                            user_id=user_id,
+                            message=f"❌ Ошибка поиска: {str(e)}",
+                            random_id=0
+                        )
+
+                # Команда для получения статистики
+                elif text == '/stats':
+                    if not has_permission(user_id, 'edit_table'):
+                        vk.messages.send(
+                            user_id=user_id,
+                            message="❌ У вас нет прав для просмотра статистики!",
+                            random_id=0
+                        )
+                        continue
+                    
+                    try:
+                        success, message = get_admin_stats(sheet, headers, header_map)
+                        
+                        vk.messages.send(
+                            user_id=user_id,
+                            message=message,
+                            random_id=0
+                        )
+                        
+                    except Exception as e:
+                        vk.messages.send(
+                            user_id=user_id,
+                            message=f"❌ Ошибка: {str(e)}",
+                            random_id=0
+                        )
+
+                # Команда для просмотра своих прав
+                elif text == '/myrights':
+                    role = get_user_role(user_id)
+                    is_super = is_super_admin(user_id)
+                    
+                    if is_super:
+                        role_emoji = "👑 СУПЕРАДМИН"
+                        permissions_list = "• Все права администратора\n• Нельзя отозвать права\n• Может отзывать права у всех, кроме суперадминов"
+                    elif role == 'admin':
+                        role_emoji = "👑 Администратор"
+                        permissions_list = "• Добавлять администраторов\n• Выдавать права\n• Редактировать таблицу"
+                    elif role == 'editor':
+                        role_emoji = "✏️ Редактор"
+                        permissions_list = "• Редактировать таблицу"
+                    else:
+                        role_emoji = "👤 Пользователь"
+                        permissions_list = "• Только просмотр команд"
+                    
+                    super_status = " (СУПЕРАДМИН)" if is_super else ""
+                    
+                    vk.messages.send(
+                        user_id=user_id,
+                        message=f"📋 Ваши права:\n\n"
+                                f"Роль: {role_emoji}{super_status}\n"
+                                f"Ваш ID: {user_id}\n\n"
+                                f"Доступные действия:\n"
+                                f"{permissions_list}",
+                        random_id=0
+                    )
+
+                # Команда для просмотра всех пользователей с правами
+                elif text == '/listusers':
+                    if not has_permission(user_id, 'grant_access'):
+                        vk.messages.send(
+                            user_id=user_id,
+                            message="❌ У вас нет прав для просмотра списка пользователей!",
+                            random_id=0
+                        )
+                        continue
+                    
+                    if not user_rights:
+                        message = "📋 Список пользователей с правами пуст."
+                    else:
+                        message = "📋 Пользователи с правами:\n\n"
+                        for uid, rights in user_rights.items():
+                            role = rights.get('role', 'user')
+                            added_by = rights.get('added_by', 'система')
+                            added_date = rights.get('added_date', 'неизвестно')
+                            is_super = rights.get('is_super', False)
+                            
+                            super_mark = "👑 СУПЕР" if is_super else ""
+                            admin_mark = "👑" if role == 'admin' and not is_super else ""
+                            editor_mark = "✏️" if role == 'editor' else ""
+                            
+                            message += f"{super_mark}{admin_mark}{editor_mark} ID: {uid}\n"
+                            message += f"  Роль: {role}\n"
+                            message += f"  Добавил: {added_by}\n"
+                            message += f"  Дата: {added_date}\n\n"
+                    
+                    vk.messages.send(
+                        user_id=user_id,
+                        message=message,
+                        random_id=0
+                    )
+
+                # Команда для просмотра суперадминов
+                elif text == '/superadmins':
+                    message = "👑 СУПЕРАДМИНЫ (нельзя отозвать права):\n\n"
+                    for admin_id in SUPER_ADMINS:
+                        message += f"• {admin_id}\n"
+                    
+                    vk.messages.send(
+                        user_id=user_id,
+                        message=message,
+                        random_id=0
+                    )
+
+                # Команда помощи
+                elif text == '/help':
+                    help_text = (
+                        "📋 СИСТЕМА УПРАВЛЕНИЯ ПРАВАМИ\n\n"
+                        "Для всех:\n"
+                        "• /help - эта справка\n"
+                        "• /myrights - мои права\n"
+                        "• /superadmins - список суперадминов\n\n"
+                        
+                        "Для редакторов и выше:\n"
+                        "• /edit [строка/ник] [поле] [значение] - редактировать\n"
+                        "• /search [запрос] - поиск администратора\n"
+                        "• /stats - статистика\n\n"
+                        
+                        "Для администраторов и выше:\n"
+                        "• /addadmin [ник] [дата] [VK] [форум] - добавить админа\n"
+                        "• /deleteadmin [ник] - удалить администратора\n"
+                        "• /grant [VK_ID] [роль] - выдать права (editor/admin)\n"
+                        "• /revoke [VK_ID] - отозвать права\n"
+                        "• /listusers - список пользователей с правами\n\n"
+                        
+                        "👑 Суперадмины (нельзя отозвать права):\n"
+                        f"{', '.join(map(str, SUPER_ADMINS))}\n\n"
+                        
+                        "Примеры:\n"
+                        "• /addadmin Vasya 01.01.2024 https://vk.com/id1 https://forum.link\n"
+                        "• /grant 123456789 editor\n"
+                        "• /grant 987654321 admin\n"
+                        "• /edit 5 Nick_Name НовоеИмя\n"
+                        "• /edit Vasya Должность Модератор\n"
+                        "• /search Vasya\n"
+                        "• /deleteadmin Vasya"
+                    )
+                    
+                    vk.messages.send(
+                        user_id=user_id,
+                        message=help_text,
+                        random_id=0
+                    )
+
+                elif text.startswith('/'):
+                    vk.messages.send(
+                        user_id=user_id,
+                        message="❌ Неизвестная команда. Введите /help для списка команд.",
+                        random_id=0
+                    )
+
+    except Exception as e:
+        print(f"!!! КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        import traceback
+        traceback.print_exc()
+        time.sleep(5)
+
+if __name__ == '__main__':
+    main()
