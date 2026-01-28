@@ -1,0 +1,165 @@
+import os
+import pickle
+import vk_api
+import time
+import gspread
+import json
+from vk_api.longpoll import VkLongPoll, VkEventType
+from google.auth.transport.requests import Request
+from google_auth_oauthlib.flow import InstalledAppFlow
+
+# --- КОНФИГУРАЦИЯ ---
+VK_TOKEN = 'vk1.a.hnuRWe9zj3RAiXc-2Jhi3ix1wDAYPeA3vv5EuURXKIptRpDR8G948Q891ndVNMuOnz69LxbvAbXQVACkIlLuhQidngypMtSGg4Sv6keay8XH-0WZOs9_L9m4LmXcV3F8pg3dyOTiujoSmzTqi9j2g5j_txPUcKILy_kbavL40GLZ_qLhzbuQjBI_PokDT1cExggdvo2CSgUOsdZBkFayLQ'
+SPREADSHEET_NAME = '29 | Работа'
+RIGHTS_FILE = 'user_rights.json'
+SUPER_ADMINS = [807253464, 679050151]
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+user_rights = {}
+
+def load_user_rights():
+    global user_rights
+    if os.path.exists(RIGHTS_FILE):
+        try:
+            with open(RIGHTS_FILE, 'r', encoding='utf-8') as f:
+                user_rights = json.load(f)
+            user_rights = {int(k): v for k, v in user_rights.items()}
+        except Exception as e:
+            print(f"Ошибка загрузки прав: {e}")
+            user_rights = {}
+    
+    for super_admin_id in SUPER_ADMINS:
+        if super_admin_id not in user_rights:
+            user_rights[super_admin_id] = {
+                'role': 'super_admin',
+                'permissions': ['add_admin', 'add_editor', 'edit_table', 'grant_access', 'revoke_super'],
+                'is_super': True,
+                'added_by': 'system',
+                'added_date': time.strftime("%d.%m.%Y %H:%M:%S")
+            }
+    save_user_rights()
+
+def save_user_rights():
+    try:
+        with open(RIGHTS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(user_rights, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Ошибка сохранения прав: {e}")
+
+def has_permission(user_id, permission):
+    if user_id in user_rights:
+        permissions = user_rights[user_id].get('permissions', [])
+        return permission in permissions
+    return False
+
+def get_google_client():
+    creds = None
+    if os.path.exists('token.pickle'):
+        with open('token.pickle', 'rb') as token:
+            creds = pickle.load(token)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file('client_secret.json', SCOPES)
+            creds = flow.run_local_server(port=8080)
+        with open('token.pickle', 'wb') as token:
+            pickle.dump(creds, token)
+    return gspread.authorize(creds)
+
+def set_cell_value(row_data, header_map, header_name, value):
+    """Безопасно устанавливает значение, не выходя за пределы существующих столбцов"""
+    if header_name in header_map:
+        col_index = header_map[header_name]
+        # Проверка, чтобы индекс не превышал размер row_data (кол-во столбцов в таблице)
+        if col_index < len(row_data):
+            row_data[col_index] = value
+            return True
+    return False
+
+def add_admin_to_sheet(sheet, headers, header_map, nickname, date_val, vk_link, forum_link):
+    try:
+        # Создаем строку, длина которой строго равна количеству заголовков (никаких новых столбцов)
+        row_data = [''] * len(headers)
+        
+        # Формулы
+        formula_m = '=ЕСЛИ(INDIRECT("B"&ROW())=1;"Ждёт 2 уровень";ЕСЛИ(INDIRECT("B"&ROW())=2;"Ждёт 3 уровень";ЕСЛИ(INDIRECT("B"&ROW())=3;"Ждёт 4 уровень";ЕСЛИ(INDIRECT("B"&ROW())=4;"Ждёт 5 уровень";ЕСЛИ(INDIRECT("B"&ROW())=5;"Спец. Следящий";"Не распознал уровень")))))'
+        formula_n = '=ЕСЛИ(INDIRECT("M"&ROW())="Ждёт 2 уровень";INDIRECT("L"&ROW())+7;ЕСЛИ(INDIRECT("M"&ROW())="Ждёт 3 уровень";INDIRECT("L"&ROW())+31;ЕСЛИ(INDIRECT("M"&ROW())="Ждёт 4 уровень";INDIRECT("L"&ROW())+60;ЕСЛИ(INDIRECT("M"&ROW())="Ждёт 5 уровень";"По доверию";ЕСЛИ(INDIRECT("M"&ROW())="Спец. Следящий";"Неизвестно";"Не удалось распознать статус")))))'
+        
+        # Заполняем только те столбцы, которые УЖЕ есть в таблице
+        set_cell_value(row_data, header_map, 'LVL', '1')
+        set_cell_value(row_data, header_map, 'Nick_Name', nickname)
+        set_cell_value(row_data, header_map, 'Должность', 'Администратор')
+        set_cell_value(row_data, header_map, 'VK', vk_link)
+        set_cell_value(row_data, header_map, 'Ссылка на форум', f'=HYPERLINK("{forum_link}"; "LINK")')
+        set_cell_value(row_data, header_map, 'Дата назначения на 1', date_val)
+        set_cell_value(row_data, header_map, 'Дата последнего повышения', date_val)
+        set_cell_value(row_data, header_map, 'Ждет уровень', formula_m)
+        set_cell_value(row_data, header_map, 'Дата повышения', formula_n)
+        set_cell_value(row_data, header_map, 'Разовые', "Разовые [0/3]")
+        set_cell_value(row_data, header_map, 'Длительные', "Длительные [0/1]")
+        set_cell_value(row_data, header_map, 'Выговоры', "Выговоры [0/3]")
+        
+        # append_row добавит данные только в рамках существующих колонок
+        sheet.append_row(values=row_data, value_input_option='USER_ENTERED')
+        return True
+    except Exception as e:
+        print(f"Ошибка: {e}")
+        return False
+
+def main():
+    load_user_rights()
+    gc = get_google_client()
+    sheet = gc.open(SPREADSHEET_NAME).sheet1
+    
+    # Обновляем карту заголовков при запуске
+    headers = sheet.get_all_values()[0]
+    header_map = {header: index for index, header in enumerate(headers)}
+    
+    vk_session = vk_api.VkApi(token=VK_TOKEN)
+    vk = vk_session.get_api()
+    longpoll = VkLongPoll(vk_session)
+    
+    print("Бот запущен и готов к работе в беседах.")
+
+    for event in longpoll.listen():
+        if event.type == VkEventType.MESSAGE_NEW and event.to_me:
+            user_id = event.user_id
+            text = event.text.strip()
+            
+            # --- ЛОГИКА ОПРЕДЕЛЕНИЯ МЕСТА ОТПРАВКИ ---
+            # Если event.from_chat — это сообщение из беседы
+            if event.from_chat:
+                send_params = {'chat_id': event.chat_id}
+            else:
+                send_params = {'user_id': user_id}
+
+            def send_msg(message):
+                vk.messages.send(**send_params, message=message, random_id=0)
+
+            # Команды
+            if text.startswith('/addadmin'):
+                if not has_permission(user_id, 'add_admin'):
+                    send_msg("❌ Нет прав.")
+                    continue
+                
+                parts = text.split()
+                if len(parts) < 5:
+                    send_msg("⚠️ Формат: /addadmin [Ник] [Дата] [ВК] [Форум]")
+                    continue
+
+                if add_admin_to_sheet(sheet, headers, header_map, parts[1], parts[2], parts[3], parts[4]):
+                    send_msg(f"✅ {parts[1]} добавлен.")
+                else:
+                    send_msg("❌ Ошибка записи (проверьте структуру таблицы).")
+
+            elif text == '/help':
+                send_msg("🤖 Бот активен.\nДоступные команды: /addadmin, /myrights, /stats, /search")
+
+            elif text == '/myrights':
+                role = user_rights.get(user_id, {}).get('role', 'user')
+                send_msg(f"👤 Ваш ID: {user_id}\n🔑 Роль: {role}")
+
+# Добавь вызовы остальных функций по аналогии (edit, search и т.д.)
+
+if __name__ == '__main__':
+    main()
