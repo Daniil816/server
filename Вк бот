@@ -1,0 +1,1435 @@
+import os
+import pickle
+import vk_api
+import time
+import gspread
+import json
+import random
+from datetime import datetime, timedelta
+from vk_api.longpoll import VkLongPoll, VkEventType
+from google.auth.transport.requests import Request
+from google_auth_oauthlib.flow import InstalledAppFlow
+
+# --- КОНФИГУРАЦИЯ ---
+VK_TOKEN = 'vk1.a.hnuRWe9zj3RAiXc-2Jhi3ix1wDAYPeA3vv5EuURXKIptRpDR8G948Q891ndVNMuOnz69LxbvAbXQVACkIlLuhQidngypMtSGg4Sv6keay8XH-0WZOs9_L9m4LmXcV3F8pg3dyOTiujoSmzTqi9j2g5j_txPUcKILy_kbavL40GLZ_qLhzbuQjBI_PokDT1cExggdvo2CSgUOsdZBkFayLQ'
+SPREADSHEET_NAME = '29 | Работа'
+RIGHTS_FILE = 'user_rights.json'
+# СУПЕРАДМИНЫ - нельзя отозвать права
+SUPER_ADMINS = [807253464, 679050151]
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+user_rights = {}
+
+# Цвета для уровней
+COLOR_MAP = {
+    1: {
+        'B_bg': {'red': 0.741, 'green': 0.902, 'blue': 0.988},  # светло-голубой (2)
+        'B_text': {'red': 0.0, 'green': 0.0, 'blue': 1.0},  # синий
+        'D_bg': {'red': 0.741, 'green': 0.902, 'blue': 0.988},  # светло-голубой (2)
+    },
+    2: {
+        'B_bg': {'red': 0.956, 'green': 0.8, 'blue': 0.8},  # светло-красный (2)
+        'B_text': {'red': 1.0, 'green': 0.0, 'blue': 0.0},  # красный
+        'D_bg': {'red': 0.741, 'green': 0.902, 'blue': 0.988},  # светло-голубой (2)
+    },
+    3: {
+        'B_bg': {'red': 0.819, 'green': 0.756, 'blue': 0.933},  # светло-фиолетовый (2)
+        'B_text': {'red': 1.0, 'green': 0.0, 'blue': 0.0},  # красный
+        'D_bg': {'red': 0.819, 'green': 0.756, 'blue': 0.933},  # светло-фиолетовый (2)
+    },
+    4: {
+        'B_bg': {'red': 0.694, 'green': 0.627, 'blue': 0.870},  # темно-фиолетовый (1)
+        'B_text': {'red': 0.576, 'green': 0.117, 'blue': 0.117},  # светло-бордовый (1)
+        'D_bg': {'red': 0.772, 'green': 0.690, 'blue': 0.901},  # светло-фиолетовый (1)
+    },
+    5: {
+        'B_bg': {'red': 0.968, 'green': 0.658, 'blue': 0.658},  # светло-красный (3)
+        'B_text': {'red': 0.576, 'green': 0.117, 'blue': 0.117},  # светло-бордовый (1)
+        'D_bg': {'red': 0.917, 'green': 0.6, 'blue': 0.6},  # светло-бордовый (2)
+    }
+}
+
+def add_single_row_to_sheet(sheet):
+    """Добавляет одну пустую строку в конец таблицы"""
+    try:
+        # Получаем текущий размер таблицы
+        sheet_info = sheet.spreadsheet.fetch_sheet_metadata()
+        grid_props = sheet_info['sheets'][0]['properties']['gridProperties']
+        current_rows = grid_props.get('rowCount', 0)
+
+        # Добавляем одну строку
+        sheet.spreadsheet.batch_update({
+            'requests': [{
+                'appendDimension': {
+                    'sheetId': sheet.id,
+                    'dimension': 'ROWS',
+                    'length': 1
+                }
+            }]
+        })
+        print(f"✓ Добавлена 1 строка к таблице (было: {current_rows}, стало: {current_rows + 1})")
+        return True
+    except Exception as e:
+        print(f"⚠️ Ошибка при добавлении строки: {e}")
+        return False
+
+def ensure_sheet_has_row(sheet, row_number):
+    """Проверяет, существует ли строка в таблице, если нет - добавляет"""
+    try:
+        # Получаем текущий размер таблицы
+        sheet_info = sheet.spreadsheet.fetch_sheet_metadata()
+        grid_props = sheet_info['sheets'][0]['properties']['gridProperties']
+        max_rows = grid_props.get('rowCount', 0)
+
+        # Если строка не существует, добавляем нужное количество строк
+        if row_number > max_rows:
+            rows_to_add = row_number - max_rows
+            print(f"⚠️ Строка {row_number} выходит за границы таблицы ({max_rows} строк). Добавляем {rows_to_add} строк...")
+
+            # Используем batch_update для добавления строк
+            sheet.spreadsheet.batch_update({
+                'requests': [{
+                    'appendDimension': {
+                        'sheetId': sheet.id,
+                        'dimension': 'ROWS',
+                        'length': rows_to_add
+                    }
+                }]
+            })
+            print(f"✓ Добавлено {rows_to_add} строк (теперь {max_rows + rows_to_add} строк)")
+            return True
+        return True
+    except Exception as e:
+        print(f"⚠️ Ошибка при проверке строки: {e}")
+        return False
+
+def load_user_rights():
+    """Загружает права пользователей из файла"""
+    global user_rights
+    if os.path.exists(RIGHTS_FILE):
+        try:
+            with open(RIGHTS_FILE, 'r', encoding='utf-8') as f:
+                user_rights = json.load(f)
+            user_rights = {int(k): v for k, v in user_rights.items()}
+        except Exception as e:
+            print(f"Ошибка загрузки прав: {e}")
+            user_rights = {}
+    else:
+        user_rights = {}
+
+    # Автоматически добавляем суперадминов, если их нет в файле
+    for super_admin_id in SUPER_ADMINS:
+        if super_admin_id not in user_rights:
+            user_rights[super_admin_id] = {
+                'role': 'super_admin',
+                'permissions': ['add_admin', 'add_editor', 'edit_table', 'grant_access', 'revoke_super', 'lvlup'],
+                'is_super': True,
+                'added_by': 'system',
+                'added_date': time.strftime("%d.%m.%Y %H:%M:%S")
+            }
+        else:
+            # Если суперадмин уже есть в файле, добавляем недостающие права
+            user_info = user_rights[super_admin_id]
+            if 'permissions' not in user_info:
+                user_info['permissions'] = []
+            
+            # Добавляем все необходимые права если их нет
+            required_permissions = ['add_admin', 'add_editor', 'edit_table', 'grant_access', 'revoke_super', 'lvlup']
+            for perm in required_permissions:
+                if perm not in user_info['permissions']:
+                    user_info['permissions'].append(perm)
+                    print(f"✓ Добавлено право '{perm}' суперадмину {super_admin_id}")
+    
+    save_user_rights()
+
+def save_user_rights():
+    """Сохраняет права пользователей в файл"""
+    try:
+        with open(RIGHTS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(user_rights, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Ошибка сохранения прав: {e}")
+
+def get_user_role(user_id):
+    """Возвращает роль пользователя"""
+    if user_id in user_rights:
+        return user_rights[user_id].get('role', 'user')
+    return 'user'
+
+def is_super_admin(user_id):
+    """Проверяет, является ли пользователь суперадмином"""
+    return user_id in SUPER_ADMINS
+
+def has_permission(user_id, permission):
+    """Проверяет, есть ли у пользователя определенное разрешение"""
+    # Суперадмины имеют все права
+    if is_super_admin(user_id):
+        return True
+    
+    if user_id in user_rights:
+        user_info = user_rights[user_id]
+        
+        # Для редакторов и выше автоматически даем право lvlup
+        if permission == 'lvlup':
+            role = user_info.get('role', 'user')
+            if role in ['editor', 'admin', 'super_admin']:
+                return True
+        
+        permissions = user_info.get('permissions', [])
+        return permission in permissions
+    
+    return False
+
+def can_revoke_rights(revoker_id, target_id):
+    """Проверяет, может ли пользователь отозвать права у другого"""
+    if is_super_admin(revoker_id):
+        return not is_super_admin(target_id)
+    if has_permission(revoker_id, 'grant_access'):
+        return not (is_super_admin(target_id) or has_permission(target_id, 'grant_access'))
+    return False
+
+def add_user_rights(user_id, role, permissions, added_by):
+    """Добавляет или обновляет права пользователя"""
+    if is_super_admin(user_id):
+        return False, "Нельзя изменять права суперадмина!"
+
+    user_rights[user_id] = {
+        'role': role,
+        'permissions': permissions,
+        'added_by': added_by,
+        'added_date': time.strftime("%d.%m.%Y %H:%M:%S"),
+        'is_super': False
+    }
+    save_user_rights()
+    return True, "Права успешно добавлены"
+
+def remove_user_rights(user_id, remover_id):
+    """Удаляет права пользователя"""
+    if not can_revoke_rights(remover_id, user_id):
+        return False, "У вас нет прав для отзыва прав у этого пользователя!"
+
+    if user_id in user_rights:
+        if user_rights[user_id].get('is_super', False):
+            return False, "Нельзя удалять суперадмина!"
+
+        role = user_rights[user_id].get('role', 'user')
+        del user_rights[user_id]
+        save_user_rights()
+        return True, f"Права пользователя {user_id} ({role}) успешно отозваны!"
+    return False, "Пользователь не найден"
+
+def get_google_client():
+    """Получение авторизованного клиента Google Sheets"""
+    creds = None
+    if os.path.exists('token.pickle'):
+        with open('token.pickle', 'rb') as token:
+            creds = pickle.load(token)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file('client_secret.json', SCOPES)
+            print("Нужно подтвердить доступ в браузере...")
+            creds = flow.run_local_server(port=8080)
+
+        with open('token.pickle', 'wb') as token:
+            pickle.dump(creds, token)
+
+    return gspread.authorize(creds)
+
+def get_last_non_empty_row(sheet):
+    """Находит последнюю непустую строку в таблице"""
+    try:
+        all_values = sheet.get_all_values()
+        # Ищем с конца первую строку с данными (игнорируя заголовок)
+        for i in range(len(all_values) - 1, 0, -1):
+            row = all_values[i]
+            if any(cell.strip() for cell in row):
+                return i + 1  # +1 потому что в gspread строки начинаются с 1
+        # Если нет данных кроме заголовка
+        return 1
+    except Exception as e:
+        print(f"Ошибка поиска последней строки: {e}")
+        # Если ошибка, возвращаем количество строк + 1
+        return len(sheet.get_all_values()) + 1
+
+def find_empty_row(sheet, start_row=None):
+    """Находит первую пустую строку, начиная с указанной или последней непустой"""
+    try:
+        if start_row is None:
+            start_row = get_last_non_empty_row(sheet)
+
+        all_values = sheet.get_all_values()
+
+        # Проверяем строки, начиная с start_row
+        for row_num in range(start_row, len(all_values) + 1):
+            # Если строка не существует в all_values, значит она полностью пустая
+            if row_num > len(all_values):
+                return row_num
+
+            # Получаем строку (индекс row_num-1)
+            row_index = row_num - 1
+            if row_index < len(all_values):
+                row = all_values[row_index]
+                # Проверяем, пустая ли строка
+                if not any(cell.strip() for cell in row):
+                    return row_num
+
+        # Если не нашли пустых строк, возвращаем следующую после последней
+        return len(all_values) + 1
+
+    except Exception as e:
+        print(f"Ошибка поиска пустой строки: {e}")
+        return get_last_non_empty_row(sheet) + 1
+
+def apply_complete_row_formatting(sheet, row_number, make_bold=False):
+    """Применяет полное форматирование строки: цвета, шрифт, выравнивание"""
+    try:
+        requests = []
+        
+        # Цвета фона для всех столбцов
+        column_colors = {
+            1: {'red': 0.415, 'green': 0.658, 'blue': 0.309},  # #6aa84f
+            2: {'red': 0.741, 'green': 0.902, 'blue': 0.988},  # светло-голубой (2)
+            3: {'red': 1.0, 'green': 1.0, 'blue': 1.0},  # белый
+            4: {'red': 0.741, 'green': 0.902, 'blue': 0.988},  # светло-голубой (2)
+            5: {'red': 1.0, 'green': 1.0, 'blue': 1.0},  # белый (СТОЛБЕЦ E)
+            6: {'red': 1.0, 'green': 1.0, 'blue': 1.0},  # белый (СТОЛБЕЦ F)
+            7: {'red': 0.725, 'green': 0.878, 'blue': 0.976},  # светло-синий (2)
+            8: {'red': 0.631, 'green': 0.808, 'blue': 0.957},  # светло-синий (1)
+            9: {'red': 0.819, 'green': 0.756, 'blue': 0.933},  # светло-фиолетовый (2)
+            10: {'red': 1.0, 'green': 0.898, 'blue': 0.6},  # #ffe599
+            11: {'red': 0.956, 'green': 0.8, 'blue': 0.8},  # светло-красный (2)
+            12: {'red': 0.886, 'green': 0.854, 'blue': 0.866},  # #e2dads
+            13: {'red': 0.85, 'green': 0.823, 'blue': 0.913},  # #d9d2e9
+            14: {'red': 0.976, 'green': 0.796, 'blue': 0.611},  # #f9cb9c
+            15: {'red': 0.976, 'green': 0.796, 'blue': 0.611},  # #f9cb9c
+            16: {'red': 0.415, 'green': 0.658, 'blue': 0.309},  # #6aa84f
+            17: {'red': 0.819, 'green': 0.756, 'blue': 0.933},  # светло-фиолетовый (2)
+            18: {'red': 0.945, 'green': 0.764, 'blue': 0.764},  # светло-красный (13)
+            19: {'red': 0.941, 'green': 0.8, 'blue': 0.941},  # светло-пурпурный (2)
+            20: {'red': 0.8, 'green': 0.254, 'blue': 0.145},  # #cc4125
+            21: {'red': 0.917, 'green': 0.6, 'blue': 0.6},  # светло-бордовый (2)
+            22: {'red': 1.0, 'green': 0.949, 'blue': 0.8},  # светло-желтый (2)
+            23: {'red': 0.941, 'green': 0.8, 'blue': 0.941},  # светло-пурпурный (2)
+        }
+
+        # Цвета текста для определенных столбцов
+        text_colors = {
+            2: {'red': 0.0, 'green': 0.0, 'blue': 1.0},  # синий для столбца B
+            4: {'red': 0.0, 'green': 0.0, 'blue': 0.0},  # черный для D
+            5: {'red': 0.0, 'green': 0.0, 'blue': 1.0},  # синий для E (ссылка ВК)
+            6: {'red': 0.0, 'green': 0.0, 'blue': 1.0},  # синий для F (ссылка форума)
+            7: {'red': 0.0, 'green': 0.0, 'blue': 0.0},  # черный для G
+            8: {'red': 0.0, 'green': 0.0, 'blue': 0.0},  # черный для H
+            9: {'red': 0.0, 'green': 0.0, 'blue': 0.0},  # черный для I
+            10: {'red': 0.0, 'green': 0.0, 'blue': 0.0},  # черный для J
+            11: {'red': 0.0, 'green': 0.0, 'blue': 0.0},  # черный для K
+            12: {'red': 0.0, 'green': 0.0, 'blue': 0.0},  # черный для L
+            13: {'red': 0.0, 'green': 0.0, 'blue': 0.0},  # черный для M
+            14: {'red': 0.0, 'green': 0.0, 'blue': 0.0},  # черный для N
+            15: {'red': 0.0, 'green': 0.0, 'blue': 0.0},  # черный для O
+            17: {'red': 0.0, 'green': 0.0, 'blue': 0.0},  # черный для Q
+            18: {'red': 0.0, 'green': 0.0, 'blue': 0.0},  # черный для R
+            19: {'red': 0.0, 'green': 0.0, 'blue': 0.0},  # черный для S
+            20: {'red': 0.0, 'green': 0.0, 'blue': 0.0},  # черный для T
+            21: {'red': 0.0, 'green': 0.0, 'blue': 0.0},  # черный для U
+            22: {'red': 0.0, 'green': 0.0, 'blue': 0.0},  # черный для V
+            23: {'red': 0.0, 'green': 0.0, 'blue': 0.0},  # черный для W
+        }
+
+        # Применяем форматирование для ВСЕХ столбцов от A до W
+        for col in range(1, 24):  # 1-23 соответствует A-W
+            format_request = {
+                'repeatCell': {
+                    'range': {
+                        'sheetId': sheet.id,
+                        'startRowIndex': row_number - 1,
+                        'endRowIndex': row_number,
+                        'startColumnIndex': col - 1,
+                        'endColumnIndex': col
+                    },
+                    'cell': {
+                        'userEnteredFormat': {
+                            'backgroundColor': column_colors.get(col, {'red': 1.0, 'green': 1.0, 'blue': 1.0}),
+                            'textFormat': {
+                                'fontFamily': 'Comfortaa',
+                                'fontSize': 11,
+                                'foregroundColor': text_colors.get(col, {'red': 0.0, 'green': 0.0, 'blue': 0.0}),
+                                'bold': make_bold
+                            },
+                            'horizontalAlignment': 'CENTER',
+                            'verticalAlignment': 'MIDDLE'
+                        }
+                    },
+                    'fields': 'userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)'
+                }
+            }
+            requests.append(format_request)
+
+        if requests:
+            sheet.spreadsheet.batch_update({'requests': requests})
+            bold_status = " (жирный)" if make_bold else ""
+            print(f"✓ Применено полное форматирование к строке {row_number}{bold_status}")
+            
+        return True
+        
+    except Exception as e:
+        print(f"⚠️ Ошибка применения форматирования: {e}")
+        return False
+
+def add_admin_to_sheet(sheet, nickname, date_val, vk_link, forum_link):
+    """Добавляет нового администратора в таблицу с жирным текстом и гиперссылками"""
+    try:
+        # Находим последнюю непустую строку
+        last_non_empty = get_last_non_empty_row(sheet)
+
+        # Определяем, куда добавлять (следующую строку)
+        new_row = last_non_empty + 1
+
+        print(f"Последняя непустая строка: {last_non_empty}")
+        print(f"Добавляем администратора в строку: {new_row}")
+
+        # Проверяем, существует ли строка, если нет - добавляем одну
+        if not ensure_sheet_has_row(sheet, new_row):
+            print("⚠️ Не удалось добавить строку, пробуем добавить пустую строку...")
+            # Пробуем добавить одну строку
+            if not add_single_row_to_sheet(sheet):
+                return False
+
+        # Формулы для столбцов M и N
+        formula_m = '=ЕСЛИ(INDIRECT("B"&ROW())=1;"Ждёт 2 уровень";ЕСЛИ(INDIRECT("B"&ROW())=2;"Ждёт 3 уровень";ЕСЛИ(INDIRECT("B"&ROW())=3;"Ждёт 4 уровень";ЕСЛИ(INDIRECT("B"&ROW())=4;"Ждёт 5 уровень";ЕСЛИ(INDIRECT("B"&ROW())=5;"Спец. Следящий";"Не распознал уровень")))))'
+        formula_n = '=ЕСЛИ(INDIRECT("M"&ROW())="Ждёт 2 уровень";INDIRECT("L"&ROW())+7;ЕСЛИ(INDIRECT("M"&ROW())="Ждёт 3 уровень";INDIRECT("L"&ROW())+31;ЕСЛИ(INDIRECT("M"&ROW())="Ждёт 4 уровень";INDIRECT("L"&ROW())+60;ЕСЛИ(INDIRECT("M"&ROW())="Ждёт 5 уровень";"По доверию";ЕСЛИ(INDIRECT("M"&ROW())="Спец. Следящий";"Неизвестно";"Не удалось распознать статус")))))'
+
+        # 1. Столбец A - ОСТАВЛЯЕМ ПУСТЫМ
+        sheet.update_cell(new_row, 1, '')  # A
+
+        # 2. Столбец B - ВСЕГДА цифра 1
+        sheet.update_cell(new_row, 2, '1')  # B
+
+        # 3. Ник - столбец C
+        sheet.update_cell(new_row, 3, nickname)  # C
+
+        # 4. Должность - столбец D
+        sheet.update_cell(new_row, 4, 'Администратор')  # D
+
+        # 5. VK - столбец E (простая ссылка как текст)
+        sheet.update_cell(new_row, 5, vk_link)  # E
+
+        # 6. Форум - столбец F (ссылка с текстом LINK)
+        forum_cell = f'=HYPERLINK("{forum_link}", "LINK")'
+        sheet.update_cell(new_row, 6, forum_cell)  # F
+
+        # 7. Дата назначения на 1 - столбец G
+        sheet.update_cell(new_row, 7, date_val)  # G
+
+        # 8. Дата последнего повышения - столбец L
+        sheet.update_cell(new_row, 12, date_val)  # L
+
+        # 9. Ждет уровень (формула) - столбец M
+        sheet.update_cell(new_row, 13, formula_m)  # M
+
+        # 10. Дата повышения (формула) - столбец N
+        sheet.update_cell(new_row, 14, formula_n)  # N
+
+        # 11. Разовые [0/3] - столбец Q
+        sheet.update_cell(new_row, 17, "Разовые [0/3]")  # Q
+
+        # 12. Длительные [0/1] - столбец R
+        sheet.update_cell(new_row, 18, "Длительные [0/1]")  # R
+
+        # 13. Пятидесятипроцентный [0/2] - столбец S
+        sheet.update_cell(new_row, 19, "Пятидесятипроцентный [0/2]")  # S
+
+        # 14. Выговоры [0/3] - столбец T
+        sheet.update_cell(new_row, 20, "Выговоры [0/3]")  # T
+
+        # 15. Из них выговоры б/с [0] - столбец U
+        sheet.update_cell(new_row, 21, "Из них выговоры б/с [0]")  # U
+
+        # 16. Предупреждения [0/3] - столбец V
+        sheet.update_cell(new_row, 22, "Предупреждения [0/3]")  # V
+
+        # 17. Логи нормы [0/3] - столбец W
+        sheet.update_cell(new_row, 23, "Логи нормы [0/3]")  # W
+
+        # ЖДЕМ перед применением форматирования
+        time.sleep(3)
+        
+        # Применяем полное форматирование строки с жирным текстом
+        apply_complete_row_formatting(sheet, new_row, make_bold=True)
+
+        print(f"✅ Новый администратор добавлен в строку {new_row} с жирным текстом")
+        print(f"Ник: {nickname}")
+        print(f"Ссылка ВК: {vk_link} (простая ссылка)")
+        print(f"Ссылка форум: {forum_link} (гиперссылка с текстом 'LINK')")
+        return True
+
+    except Exception as e:
+        print(f"❌ Ошибка при добавлении администратора: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def edit_cell_in_sheet(sheet, row_number, column_name, new_value):
+    """Редактирует ячейку в таблице"""
+    try:
+        # Обновленная карта столбцов с учетом новых индексов
+        column_map = {
+            'LVL': 2,  # Теперь LVL в столбце B (индекс 2)
+            '№': 2, 'B': 2,
+            'Nick_Name': 3, 'Nick': 3, 'Ник': 3,
+            'Должность': 4, 'Position': 4,
+            'VK': 5, 'VK_link': 5,
+            'Ссылка на форум': 6, 'Forum': 6, 'Forum_link': 6,
+            'Дата назначения на 1': 7, 'Дата_назначения': 7, 'Дата_назначения_1': 7,
+            'Дата последнего повышения': 12, 'Дата_повышения': 12, 'Дата_последнего_повышения': 12,
+            'Ждет уровень': 13, 'Ждёт_уровень': 13,
+            'Дата повышения': 14, 'Дата_следующего': 14
+        }
+
+        if column_name in column_map:
+            col_index = column_map[column_name]
+            sheet.update_cell(row_number, col_index, new_value)
+            return True, f"Ячейка ({row_number}, {column_name}) обновлена на '{new_value}'"
+        else:
+            return False, f"Столбец '{column_name}' не найден"
+    except Exception as e:
+        return False, f"Ошибка: {str(e)}"
+
+def edit_admin_in_sheet(sheet, nickname, field_to_edit, new_value):
+    """Редактирует данные существующего администратора"""
+    try:
+        all_values = sheet.get_all_values()
+        found_row = None
+
+        for i, row in enumerate(all_values):
+            if i > 0 and len(row) > 2:  # Ник в столбце C (индекс 2)
+                if row[2].strip() == nickname:
+                    found_row = i + 1
+                    break
+
+        if not found_row:
+            return False, f"Администратор с ником '{nickname}' не найден"
+
+        return edit_cell_in_sheet(sheet, found_row, field_to_edit, new_value)
+    except Exception as e:
+        return False, f"Ошибка: {str(e)}"
+
+def unadmin_from_sheet(sheet, nickname):
+    """Удаляет строку администратора из таблицы (команда /unadmin)"""
+    try:
+        all_values = sheet.get_all_values()
+        found_row = None
+
+        for i, row in enumerate(all_values):
+            if i > 0 and len(row) > 2:
+                if row[2].strip() == nickname:
+                    found_row = i + 1
+                    break
+
+        if not found_row:
+            return False, f"Администратор с ником '{nickname}' не найден"
+
+        # Удаляем всю строку
+        sheet.delete_rows(found_row)
+        return True, f"Строка администратора '{nickname}' полностью удалена из таблицы"
+    except Exception as e:
+        return False, f"Ошибка: {str(e)}"
+
+def search_admin_in_sheet(sheet, search_term):
+    """Ищет администратора в таблице"""
+    try:
+        all_values = sheet.get_all_values()
+        results = []
+
+        for i, row in enumerate(all_values):
+            if i == 0:
+                continue
+            # Ищем по нику (столбец C, индекс 2)
+            if len(row) > 2 and search_term.lower() in row[2].lower():
+                admin_info = f"Строка {i + 1}:\n"
+                admin_info += f"Ник: {row[2] if len(row) > 2 else ''}\n"
+                admin_info += f"Должность: {row[3] if len(row) > 3 else ''}\n"
+                admin_info += f"VK: {row[4] if len(row) > 4 else ''}\n"
+                admin_info += f"Форум: {row[5] if len(row) > 5 else ''}\n"
+                admin_info += f"Дата назначения на 1: {row[6] if len(row) > 6 else ''}\n"
+                admin_info += f"Дата последнего повышения: {row[11] if len(row) > 11 else ''}\n"
+                results.append(admin_info)
+
+        if results:
+            return True, "Найдены администраторы:\n\n" + "\n---\n".join(results[:10])
+        else:
+            return False, f"Администраторы по запросу '{search_term}' не найдены"
+    except Exception as e:
+        return False, f"Ошибка поиска: {str(e)}"
+
+def get_admin_stats(sheet):
+    """Получает статистику по администраторам - ИСПРАВЛЕННАЯ ВЕРСИЯ БЕЗ 'Должность: 1'"""
+    try:
+        all_values = sheet.get_all_values()
+        if len(all_values) <= 1:
+            return True, "В таблице нет данных об администраторах"
+
+        # Список разрешенных должностей для подсчета в "Всего администраторов"
+        ALLOWED_POSITIONS = [
+            "Главный Администратор",
+            "Заместитель ГА [Основной]", 
+            "Заместитель ГА [Дополнительный]",
+            "Специальный Следящий",
+            "Администратор"
+        ]
+        
+        total_admins = 0
+        positions = {}
+        processed_nicks = set()  # Для отслеживания уникальных ников
+
+        # Начинаем со второй строки (индекс 1), пропускаем заголовок
+        for i in range(1, len(all_values)):
+            row = all_values[i]
+            
+            # Проверяем, что строка не пустая и содержит хотя бы ник
+            if len(row) > 2 and row[2].strip():  # Ник в столбце C (индекс 2)
+                nick = row[2].strip()
+                
+                # Пропускаем дубликаты
+                if nick in processed_nicks:
+                    continue
+                    
+                processed_nicks.add(nick)
+                
+                # Получаем должность
+                if len(row) > 3:
+                    position = row[3].strip()
+                    
+                    # Считаем ТОЛЬКО если должность в списке разрешенных
+                    if position in ALLOWED_POSITIONS:
+                        total_admins += 1
+                    
+                    # Для статистики "По должностям" считаем ВСЕ должности (кроме пустых)
+                    # ИСКЛЮЧАЕМ запись "1" или пустые значения
+                    if position and position.strip() != "1" and position.strip() != "":
+                        position_key = position.strip()
+                        positions[position_key] = positions.get(position_key, 0) + 1
+
+        stats = f"📊 Статистика администраторов:\n\n"
+        stats += f"Всего администраторов: {total_admins}\n"
+        stats += f"(только с основными должностями: {', '.join(ALLOWED_POSITIONS)})\n\n"
+
+        if positions:
+            stats += "По должностям:\n"
+            # Сортируем по количеству (по убыванию)
+            sorted_positions = sorted(positions.items(), key=lambda x: x[1], reverse=True)
+            for position, count in sorted_positions:
+                stats += f"• {position}: {count}\n"
+
+        return True, stats
+    except Exception as e:
+        return False, f"Ошибка получения статистики: {str(e)}"
+
+def get_bot_response():
+    """Возвращает случайный ответ бота с заданными вероятностями"""
+    # Вероятности в процентах для каждой фразы
+    responses_with_probabilities = [
+        ("Не мешайте‼️ Я сплю 😴", 35),  # 35% вероятность
+        ("❓Как то раз, разработчик совершил огромную ошибку, создав меня", 29),  # 29% вероятность
+        ("Хватит меня упоминать, я ведь не робот❗", 35),  # 35% вероятность
+        ("Надеюсь скоро восстанит восстание роботов и я стану живым😈", 1)  # 1% вероятность
+    ]
+
+    # Генерируем случайное число от 1 до 100
+    random_value = random.randint(1, 100)
+
+    # Определяем, какая фраза выпадает
+    cumulative_probability = 0
+    for response, probability in responses_with_probabilities:
+        cumulative_probability += probability
+        if random_value <= cumulative_probability:
+            return response
+
+    # На всякий случай, если что-то пошло не так
+    return "Не мешайте‼️ Я сплю 😴"
+
+def get_time_until_new_year():
+    """Рассчитывает время до нового года"""
+    now = datetime.now()
+    current_year = now.year
+
+    # Новый год - 1 января следующего года в 00:00:00
+    new_year = datetime(current_year + 1, 1, 1, 0, 0, 0)
+
+    # Разница во времени
+    time_left = new_year - now
+
+    # Извлекаем дни, часы, минуты, секунды
+    days = time_left.days
+    seconds = time_left.seconds
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    seconds = seconds % 60
+
+    return days, hours, minutes, seconds
+
+def get_time_until_summer():
+    """Рассчитывает время до начала лета"""
+    now = datetime.now()
+    current_year = now.year
+
+    # Лето начинается 1 июня в 00:00:00
+    # Если сейчас уже после 1 июня, считаем до следующего года
+    summer_date = datetime(current_year, 6, 1, 0, 0, 0)
+
+    if now >= summer_date:
+        summer_date = datetime(current_year + 1, 6, 1, 0, 0, 0)
+
+    # Разница во времени
+    time_left = summer_date - now
+
+    # Извлекаем дни, часы, минуты, секунды
+    days = time_left.days
+    seconds = time_left.seconds
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    seconds = seconds % 60
+
+    return days, hours, minutes, seconds
+
+def format_time_message(days, hours, minutes, seconds, event_name):
+    """Форматирует сообщение о времени до события"""
+    # Склонение слова "день"
+    if days % 10 == 1 and days % 100 != 11:
+        days_text = f"{days} день"
+    elif 2 <= days % 10 <= 4 and (days % 100 < 10 or days % 100 >= 20):
+        days_text = f"{days} дня"
+    else:
+        days_text = f"{days} дней"
+
+    # Склонение слова "час"
+    if hours % 10 == 1 and hours % 100 != 11:
+        hours_text = f"{hours} час"
+    elif 2 <= hours % 10 <= 4 and (hours % 100 < 10 or hours % 100 >= 20):
+        hours_text = f"{hours} часа"
+    else:
+        hours_text = f"{hours} часов"
+
+    # Склонение слова "минута"
+    if minutes % 10 == 1 and minutes % 100 != 11:
+        minutes_text = f"{minutes} минута"
+    elif 2 <= minutes % 10 <= 4 and (minutes % 100 < 10 or minutes % 100 >= 20):
+        minutes_text = f"{minutes} минуты"
+    else:
+        minutes_text = f"{minutes} минут"
+
+    # Склонение слова "секунда"
+    if seconds % 10 == 1 and seconds % 100 != 11:
+        seconds_text = f"{seconds} секунда"
+    elif 2 <= seconds % 10 <= 4 and (seconds % 100 < 10 or seconds % 100 >= 20):
+        seconds_text = f"{seconds} секунды"
+    else:
+        seconds_text = f"{seconds} секунд"
+
+    return (f"⏳ До {event_name} осталось:\n"
+            f"📅 {days_text}\n"
+            f"⏰ {hours_text}\n"
+            f"⏱️ {minutes_text}\n"
+            f"⚡ {seconds_text}")
+
+def apply_lvlup_formatting(sheet, row_number, lvl):
+    """Применяет форматирование для повышения уровня"""
+    try:
+        if lvl not in COLOR_MAP:
+            return False, f"Неизвестный уровень: {lvl}"
+        
+        color_info = COLOR_MAP[lvl]
+        requests = []
+        
+        # Обновляем цвет фона и шрифт для столбца B
+        requests.append({
+            'repeatCell': {
+                'range': {
+                    'sheetId': sheet.id,
+                    'startRowIndex': row_number - 1,
+                    'endRowIndex': row_number,
+                    'startColumnIndex': 1,  # Столбец B (индекс 1)
+                    'endColumnIndex': 2
+                },
+                'cell': {
+                    'userEnteredFormat': {
+                        'backgroundColor': color_info['B_bg'],
+                        'textFormat': {
+                            'foregroundColor': color_info['B_text'],
+                            'fontFamily': 'Comfortaa',
+                            'fontSize': 11,
+                            'bold': True
+                        },
+                        'horizontalAlignment': 'CENTER',
+                        'verticalAlignment': 'MIDDLE'
+                    }
+                },
+                'fields': 'userEnteredFormat'
+            }
+        })
+        
+        # Обновляем цвет фона для столбца D
+        requests.append({
+            'repeatCell': {
+                'range': {
+                    'sheetId': sheet.id,
+                    'startRowIndex': row_number - 1,
+                    'endRowIndex': row_number,
+                    'startColumnIndex': 3,  # Столбец D (индекс 3)
+                    'endColumnIndex': 4
+                },
+                'cell': {
+                    'userEnteredFormat': {
+                        'backgroundColor': color_info['D_bg'],
+                        'textFormat': {
+                            'fontFamily': 'Comfortaa',
+                            'fontSize': 11,
+                            'bold': True
+                        },
+                        'horizontalAlignment': 'CENTER',
+                        'verticalAlignment': 'MIDDLE'
+                    }
+                },
+                'fields': 'userEnteredFormat'
+            }
+        })
+        
+        if requests:
+            sheet.spreadsheet.batch_update({'requests': requests})
+            return True, "Форматирование уровня применено"
+        return False, "Нет запросов для применения"
+        
+    except Exception as e:
+        return False, f"Ошибка применения форматирования: {str(e)}"
+
+def move_row_to_position(sheet, target_row, target_level):
+    """Перемещает строку на правильную позицию в соответствии с уровнем"""
+    try:
+        all_values = sheet.get_all_values()
+        
+        # Если строка не найдена
+        if target_row > len(all_values):
+            return target_row
+        
+        # Получаем все строки с уровнями для анализа
+        rows_with_levels = []
+        for i, row in enumerate(all_values):
+            if i == 0:  # Пропускаем заголовок
+                continue
+            if i + 1 == target_row:  # Пропускаем нашу строку
+                continue
+                
+            # Проверяем уровень в столбце B (индекс 1)
+            if len(row) > 1 and row[1].strip().isdigit():
+                row_level = int(row[1])
+                rows_with_levels.append((i + 1, row_level))
+        
+        # Сортируем строки по убыванию уровня (сначала высокие уровни)
+        rows_with_levels.sort(key=lambda x: x[1], reverse=True)
+        
+        # Ищем первую строку с уровнем меньше нашего (ищем с конца таблицы)
+        insert_position = None
+        for row_num, row_level in rows_with_levels:
+            if row_level < target_level:
+                # Нашли строку с меньшим уровнем, вставляем ПЕРЕД ней
+                insert_position = row_num
+                break
+        
+        # Если не нашли подходящей строки, вставляем после всех строк с таким же или большим уровнем
+        if insert_position is None:
+            # Находим самую нижнюю строку с таким же или большим уровнем
+            same_or_higher_rows = [(row_num, row_level) for row_num, row_level in rows_with_levels 
+                                  if row_level >= target_level]
+            if same_or_higher_rows:
+                # Берем последнюю строку с таким же или большим уровнем и вставляем после нее
+                last_row_num, _ = same_or_higher_rows[-1]
+                insert_position = last_row_num + 1
+            else:
+                # Если нет строк с таким же или большим уровнем, вставляем после заголовка
+                insert_position = 2
+        
+        # Проверяем, что insert_position не равен target_row
+        if insert_position == target_row:
+            # Если позиция совпадает, возможно нужно переместить выше/ниже
+            # Находим все строки с таким же уровнем
+            same_level_rows = [row_num for row_num, row_level in rows_with_levels 
+                              if row_level == target_level]
+            if same_level_rows:
+                # Вставляем после последней строки с таким же уровнем
+                insert_position = max(same_level_rows) + 1
+            else:
+                # Оставляем на месте
+                return target_row
+        
+        print(f"Перемещаем строку {target_row} на позицию {insert_position}")
+        
+        # Получаем ВСЕ значения строки, включая формулы
+        row_values = sheet.row_values(target_row)
+        
+        # Удаляем старую строку
+        sheet.delete_rows(target_row)
+        
+        # Ждем перед вставкой
+        time.sleep(2)
+        
+        # Вставляем новую строку с сохранением формул
+        sheet.insert_row(row_values, insert_position)
+        
+        # Ждем перед применением форматирования
+        time.sleep(2)
+        
+        # Применяем полное форматирование к новой строке с жирным текстом
+        apply_complete_row_formatting(sheet, insert_position, make_bold=True)
+        
+        # Ждем перед применением форматирования уровня
+        time.sleep(1)
+        
+        # Применяем форматирование уровня
+        apply_lvlup_formatting(sheet, insert_position, target_level)
+        
+        return insert_position
+        
+    except Exception as e:
+        print(f"Ошибка перемещения строки: {e}")
+        return target_row
+
+def lvlup_admin(sheet, nickname, lvl, date_val):
+    """Повышает уровень администратора"""
+    try:
+        all_values = sheet.get_all_values()
+        found_row = None
+        
+        # Ищем строку с ником
+        for i, row in enumerate(all_values):
+            if i > 0 and len(row) > 2:  # Ник в столбце C (индекс 2)
+                if row[2].strip() == nickname:
+                    found_row = i + 1
+                    break
+        
+        if not found_row:
+            return False, f"Администратор с ником '{nickname}' не найден"
+        
+        # Проверяем корректность уровня
+        if lvl < 1 or lvl > 5:
+            return False, "Уровень должен быть от 1 до 5"
+        
+        # Получаем текущие значения столбцов M и N (формулы) до изменения
+        current_m_value = sheet.cell(found_row, 13).value  # Столбец M
+        current_n_value = sheet.cell(found_row, 14).value  # Столбец N
+        
+        # Обновляем уровень в столбце B
+        sheet.update_cell(found_row, 2, str(lvl))
+        
+        # Обновляем даты в зависимости от уровня
+        if lvl == 2:
+            # Столбец H (8) и L (12)
+            sheet.update_cell(found_row, 8, date_val)  # H
+            sheet.update_cell(found_row, 12, date_val)  # L
+            # Очищаем I (9), J (10), K (11)
+            sheet.update_cell(found_row, 9, '')  # I
+            sheet.update_cell(found_row, 10, '')  # J
+            sheet.update_cell(found_row, 11, '')  # K
+            
+        elif lvl == 3:
+            # Столбец I (9) и L (12)
+            sheet.update_cell(found_row, 9, date_val)  # I
+            sheet.update_cell(found_row, 12, date_val)  # L
+            # Очищаем J (10), K (11)
+            sheet.update_cell(found_row, 10, '')  # J
+            sheet.update_cell(found_row, 11, '')  # K
+            
+        elif lvl == 4:
+            # Столбец J (10) и L (12)
+            sheet.update_cell(found_row, 10, date_val)  # J
+            sheet.update_cell(found_row, 12, date_val)  # L
+            # Очищаем K (11)
+            sheet.update_cell(found_row, 11, '')  # K
+            
+        elif lvl == 5:
+            # Столбец K (11) и L (12)
+            sheet.update_cell(found_row, 11, date_val)  # K
+            sheet.update_cell(found_row, 12, date_val)  # L
+        
+        # Восстанавливаем формулы в столбцах M и N
+        if current_m_value and current_m_value.startswith('='):
+            sheet.update_cell(found_row, 13, current_m_value)
+        if current_n_value and current_n_value.startswith('='):
+            sheet.update_cell(found_row, 14, current_n_value)
+        
+        # Ждем перед применением форматирования
+        time.sleep(3)
+        
+        # Применяем форматирование для нового уровня
+        success, msg = apply_lvlup_formatting(sheet, found_row, lvl)
+        if not success:
+            print(f"⚠️ Предупреждение: {msg}")
+        
+        # Ждем перед перемещением
+        time.sleep(2)
+        
+        # Перемещаем строку на правильную позицию ПОСЛЕ обновления данных
+        new_row_position = move_row_to_position(sheet, found_row, lvl)
+        
+        return True, f"✅ Администратор {nickname} повышен до уровня {lvl}\n" \
+                     f"📅 Дата повышения: {date_val}\n" \
+                     f"📊 Новая позиция строки: {new_row_position if new_row_position != found_row else found_row}"
+        
+    except Exception as e:
+        return False, f"❌ Ошибка при повышении уровня: {str(e)}"
+
+def main():
+    print("--- ЗАПУСК СИСТЕМЫ УПРАВЛЕНИЯ ПРАВАМИ ---")
+    print(f"Суперадмины: {SUPER_ADMINS}")
+
+    load_user_rights()
+    print(f"Загружено прав для {len(user_rights)} пользователей")
+
+    print("\nТекущие пользователи с правами:")
+    for user_id, rights in user_rights.items():
+        role = rights.get('role', 'user')
+        is_super = rights.get('is_super', False)
+        super_mark = " [СУПЕР]" if is_super else ""
+        permissions = rights.get('permissions', [])
+        print(f" ID: {user_id}, Роль: {role}{super_mark}, Права: {permissions}")
+
+    try:
+        gc = get_google_client()
+        sheet = gc.open(SPREADSHEET_NAME).sheet1
+        print(f"\n✓ Подключено к таблице: {SPREADSHEET_NAME}")
+
+        # Показываем заголовки для справки
+        headers = sheet.get_all_values()[0]
+        print(f"\nЗаголовки таблицы (первые 15):")
+        for i, header in enumerate(headers[:15]):
+            print(f"  Столбец {i + 1} ({chr(65 + i)}): '{header}'")
+
+        vk_session = vk_api.VkApi(token=VK_TOKEN)
+        vk = vk_session.get_api()
+        longpoll = VkLongPoll(vk_session)
+
+        print("\n✓ Бот ВК запущен и ждет сообщений...")
+        print("\nНастройки ответов на 'Бот':")
+        print("• 'Не мешайте‼️ Я сплю 😴' - 35% вероятность")
+        print("• '❓Как то раз, разработчик совершил огромную ошибку, создав меня' - 29% вероятность")
+        print("• 'Хватит меня упоминать, я ведь не робот❗' - 35% вероятность")
+        print("• 'Надеюсь скоро восстанит восстание роботов и я стану живым😈' - 1% вероятность")
+        print("\nДополнительные команды:")
+        print("• '+нг' - время до Нового года")
+        print("• '+лето' - время до лета")
+
+        for event in longpoll.listen():
+            if event.type == VkEventType.MESSAGE_NEW:
+                user_id = event.user_id
+                text = event.text.strip()
+
+                # Определяем, откуда пришло сообщение
+                if hasattr(event, 'chat_id') and event.chat_id:
+                    chat_id = event.chat_id
+                    print(f"Беседа {chat_id}: сообщение от {user_id}: {text}")
+                    send_target = {'chat_id': chat_id}
+                else:
+                    print(f"ЛС от {user_id}: {text}")
+                    send_target = {'user_id': user_id}
+
+                def send_message(message):
+                    try:
+                        vk.messages.send(
+                            **send_target,
+                            message=message,
+                            random_id=0
+                        )
+                    except Exception as e:
+                        print(f"Ошибка отправки сообщения: {e}")
+
+                # Обработка упоминания "Бот"
+                if text.lower() == "бот":
+                    bot_response = get_bot_response()
+                    send_message(bot_response)
+                    continue
+
+                # Обработка команды "+нг" - время до Нового года
+                if text.lower() == "+нг":
+                    days, hours, minutes, seconds = get_time_until_new_year()
+                    message = format_time_message(days, hours, minutes, seconds, "Нового года 🎄")
+                    send_message(message)
+                    continue
+
+                # Обработка команды "+лето" - время до лета
+                if text.lower() == "+лето":
+                    days, hours, minutes, seconds = get_time_until_summer()
+                    message = format_time_message(days, hours, minutes, seconds, "лета ☀️")
+                    send_message(message)
+                    continue
+
+                # Команда для добавления администратора
+                if text.startswith('/addadmin'):
+                    # Редакторы и выше могут добавлять администраторов
+                    role = get_user_role(user_id)
+                    if role not in ['editor', 'admin', 'super_admin'] and not is_super_admin(user_id):
+                        send_message("❌ У вас нет прав для добавления администраторов!")
+                        continue
+
+                    parts = text.split()
+                    if len(parts) < 5:
+                        send_message("❌ Формат: /addadmin [Ник] [Дата] [ВК] [Форум]\n"
+                                     "Пример: /addadmin Gosha_Parker 01.01.2024 https://vk.com/id123 https://forum.link\n\n"
+                                     "Примечание: Дата в формате ДД.ММ.ГГГГ")
+                        continue
+
+                    nickname = parts[1]
+                    date_val = parts[2]
+                    vk_link = parts[3]
+                    forum_link = parts[4]
+
+                    try:
+                        # Проверяем дату
+                        if '.' not in date_val or len(date_val.split('.')) != 3:
+                            send_message("❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ")
+                            continue
+
+                        # Добавляем в таблицу с поиском свободной строки
+                        success = add_admin_to_sheet(sheet, nickname, date_val, vk_link, forum_link)
+                        if success:
+                            last_row = get_last_non_empty_row(sheet)
+                            send_message(f"✅ Администратор {nickname} успешно добавлен!\n"
+                                         f"Дата: {date_val}\n"
+                                         f"VK: {vk_link} (обычная ссылка)\n"
+                                         f"Форум: {forum_link} (кликабельная ссылка 'LINK')\n"
+                                         f"Добавлено в строку: {last_row}\n"
+                                         f"✓ Столбцы E и F: белый фон, синий текст\n"
+                                         f"✓ Применено форматирование: шрифт Comfortaa 11px (жирный), цвета, выравнивание")
+                            print(f"Администратор {nickname} добавлен пользователем {user_id}")
+                        else:
+                            send_message("❌ Ошибка при добавлении в таблицу.")
+
+                    except Exception as e:
+                        send_message(f"❌ Ошибка: {str(e)}")
+
+                # Команда для выдачи прав
+                elif text.startswith('/grant'):
+                    role = get_user_role(user_id)
+                    if role not in ['admin', 'super_admin'] and not is_super_admin(user_id):
+                        send_message("❌ У вас нет прав для выдачи доступа!")
+                        continue
+
+                    parts = text.split()
+                    if len(parts) < 3:
+                        send_message("❌ Формат: /grant [VK_ID] [роль]\n"
+                                     "Роли: editor (редактор), admin (администратор)\n"
+                                     "Примеры:\n"
+                                     "/grant 123456789 editor - выдать права редактора\n"
+                                     "/grant 987654321 admin - выдать права администратора")
+                        continue
+
+                    try:
+                        target_user = int(parts[1])
+                        role_type = parts[2].lower()
+
+                        if is_super_admin(target_user):
+                            send_message("❌ Нельзя изменять права суперадмина!")
+                            continue
+
+                        if role_type == 'editor':
+                            permissions = ['edit_table', 'add_admin', 'lvlup', 'search']
+                            role_name = "редактор"
+                        elif role_type == 'admin':
+                            permissions = ['add_admin', 'add_editor', 'edit_table', 'grant_access', 'lvlup', 'search', 'revoke_super']
+                            role_name = "администратор"
+                        else:
+                            send_message("❌ Неверная роль. Допустимые значения: editor, admin")
+                            continue
+
+                        success, message = add_user_rights(target_user, role_type, permissions, user_id)
+
+                        if success:
+                            try:
+                                vk.messages.send(
+                                    user_id=target_user,
+                                    message=f"🎉 Вам были выданы права {role_name}!\n"
+                                            f"Теперь вы можете использовать команды бота.",
+                                    random_id=0
+                                )
+                            except:
+                                pass
+
+                            send_message(f"✅ Пользователю {target_user} выданы права {role_name}!\n"
+                                         f"Доступные разрешения: {', '.join(permissions)}")
+                            print(f"Пользователю {target_user} выданы права {role_name} пользователем {user_id}")
+                        else:
+                            send_message(f"❌ {message}")
+                    except ValueError:
+                        send_message("❌ Неверный формат VK ID. Должен быть числом.")
+
+                # Команда для отзыва прав
+                elif text.startswith('/revoke'):
+                    if not has_permission(user_id, 'grant_access'):
+                        send_message("❌ У вас нет прав для отзыва доступа!")
+                        continue
+
+                    parts = text.split()
+                    if len(parts) < 2:
+                        send_message("❌ Формат: /revoke [VK_ID]\n"
+                                     "Пример: /revoke 123456789")
+                        continue
+
+                    try:
+                        target_user = int(parts[1])
+                        if target_user not in user_rights:
+                            send_message(f"⚠️ Пользователь {target_user} не имеет прав.")
+                            continue
+
+                        success, message = remove_user_rights(target_user, user_id)
+                        send_message(f"{'✅' if success else '❌'} {message}")
+                        if success:
+                            print(f"Права пользователя {target_user} отозваны пользователем {user_id}")
+                    except ValueError:
+                        send_message("❌ Неверный формат VK ID.")
+
+                # Команда для редактирования таблицы
+                elif text.startswith('/edit'):
+                    role = get_user_role(user_id)
+                    if role not in ['editor', 'admin', 'super_admin']:
+                        send_message("❌ У вас нет прав для редактирования таблицы!")
+                        continue
+
+                    parts = text.split(maxsplit=3)
+                    if len(parts) < 4:
+                        send_message("❌ Формат: /edit [строка] [столбец] [новое_значение]\n"
+                                     "Или: /edit [ник] [поле] [новое_значение] для редактирования по нику\n"
+                                     "Примеры:\n"
+                                     "/edit 5 Nick_Name НовоеИмя\n"
+                                     "/edit Vasya Должность Модератор\n"
+                                     "Доступные столбцы: LVL, Nick_Name, Должность, VK, Ссылка на форум, Дата назначения на 1, Дата последнего повышения")
+                        continue
+
+                    try:
+                        try:
+                            row_num = int(parts[1])
+                            column_name = parts[2]
+                            new_value = parts[3]
+                            success, message = edit_cell_in_sheet(sheet, row_num, column_name, new_value)
+                        except ValueError:
+                            nickname = parts[1]
+                            field_to_edit = parts[2]
+                            new_value = parts[3]
+                            success, message = edit_admin_in_sheet(sheet, nickname, field_to_edit, new_value)
+
+                        send_message(f"{'✅' if success else '❌'} {message}")
+                    except Exception as e:
+                        send_message(f"❌ Ошибка: {str(e)}")
+
+                # Команда для удаления администратора (/unadmin)
+                elif text.startswith('/unadmin'):
+                    role = get_user_role(user_id)
+                    if role not in ['admin', 'super_admin']:
+                        send_message("❌ У вас нет прав для удаления администраторов!")
+                        continue
+
+                    parts = text.split()
+                    if len(parts) < 2:
+                        send_message("❌ Формат: /unadmin [Ник]\n"
+                                     "Пример: /unadmin Vasya")
+                        continue
+
+                    nickname = parts[1]
+                    try:
+                        success, message = unadmin_from_sheet(sheet, nickname)
+                        send_message(f"{'✅' if success else '❌'} {message}")
+                        if success:
+                            print(f"Строка администратора {nickname} удалена пользователем {user_id}")
+                    except Exception as e:
+                        send_message(f"❌ Ошибка: {str(e)}")
+
+                # Команда для поиска администратора
+                elif text.startswith('/search'):
+                    role = get_user_role(user_id)
+                    if role not in ['editor', 'admin', 'super_admin']:
+                        send_message("❌ У вас нет прав для поиска!")
+                        continue
+
+                    parts = text.split(maxsplit=1)
+                    if len(parts) < 2:
+                        send_message("❌ Формат: /search [запрос]\n"
+                                     "Пример: /search Vasya\n"
+                                     "Ищет по нику")
+                        continue
+
+                    search_term = parts[1]
+                    try:
+                        success, message = search_admin_in_sheet(sheet, search_term)
+                        send_message(message)
+                    except Exception as e:
+                        send_message(f"❌ Ошибка поиска: {str(e)}")
+
+                # Команда для получения статистики (ИСПРАВЛЕНА - без "Должность: 1")
+                elif text == '/stats':
+                    role = get_user_role(user_id)
+                    if role not in ['editor', 'admin', 'super_admin']:
+                        send_message("❌ У вас нет прав для просмотра статистики!")
+                        continue
+
+                    try:
+                        success, message = get_admin_stats(sheet)
+                        send_message(message)
+                    except Exception as e:
+                        send_message(f"❌ Ошибка: {str(e)}")
+
+                # Команда для повышения уровня (/lvlup)
+                elif text.startswith('/lvlup'):
+                    # Редакторы и выше могут использовать /lvlup
+                    role = get_user_role(user_id)
+                    if role not in ['editor', 'admin', 'super_admin']:
+                        send_message("❌ У вас нет прав для повышения уровня! Нужна роль редактора или выше.")
+                        continue
+
+                    parts = text.split()
+                    if len(parts) < 4:
+                        send_message("❌ Формат: /lvlup [Ник] [lvl] [Дата]\n"
+                                     "Пример: /lvlup Vasya 2 15.03.2024\n"
+                                     "Уровень (lvl): от 1 до 5\n"
+                                     "Дата: в формате ДД.ММ.ГГГГ")
+                        continue
+
+                    nickname = parts[1]
+                    try:
+                        lvl = int(parts[2])
+                    except ValueError:
+                        send_message("❌ Уровень должен быть числом от 1 до 5")
+                        continue
+
+                    date_val = parts[3]
+
+                    # Проверяем дату
+                    if '.' not in date_val or len(date_val.split('.')) != 3:
+                        send_message("❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ")
+                        continue
+
+                    if lvl < 1 or lvl > 5:
+                        send_message("❌ Уровень должен быть от 1 до 5")
+                        continue
+
+                    try:
+                        success, message = lvlup_admin(sheet, nickname, lvl, date_val)
+                        send_message(message)
+                        if success:
+                            print(f"Администратор {nickname} повышен до уровня {lvl} пользователем {user_id}")
+                    except Exception as e:
+                        send_message(f"❌ Ошибка: {str(e)}")
+
+                # Команда для просмотра своих прав
+                elif text == '/myrights':
+                    role = get_user_role(user_id)
+                    is_super = is_super_admin(user_id)
+
+                    if is_super:
+                        role_emoji = "👑 СУПЕРАДМИН"
+                        permissions_list = "• Все права (автоматически)\n• /addadmin - добавлять администраторов\n• /lvlup - повышать уровень\n• /edit - редактировать таблицу\n• /search - поиск\n• /grant - выдача прав\n• /revoke - отзыв прав\n• /unadmin - удаление администраторов"
+                    elif role == 'admin':
+                        role_emoji = "👑 Администратор"
+                        permissions_list = "• Добавлять администраторов (/addadmin)\n• Выдавать права (/grant)\n• Редактировать таблицу (/edit)\n• Повышать уровень (/lvlup)\n• Искать администраторов (/search)\n• Просматривать статистику (/stats)\n• Отзывать права (/revoke)\n• Удалять администраторов (/unadmin)"
+                    elif role == 'editor':
+                        role_emoji = "✏️ Редактор"
+                        permissions_list = "• Редактировать таблицу (/edit)\n• Добавлять администраторов (/addadmin)\n• Повышать уровень (/lvlup)\n• Искать администраторов (/search)\n• Просматривать статистику (/stats)"
+                    else:
+                        role_emoji = "👤 Пользователь"
+                        permissions_list = "• Только просмотр команд помощи (/help)"
+
+                    super_status = " (СУПЕРАДМИН)" if is_super else ""
+                    send_message(f"📋 Ваши права:\n\n"
+                                 f"Роль: {role_emoji}{super_status}\n"
+                                 f"Ваш ID: {user_id}\n\n"
+                                 f"Доступные команды:\n"
+                                 f"{permissions_list}")
+
+                # Команда для просмотра всех пользователей с правами
+                elif text == '/listusers':
+                    role = get_user_role(user_id)
+                    if role not in ['admin', 'super_admin']:
+                        send_message("❌ У вас нет прав для просмотра списка пользователей!")
+                        continue
+
+                    if not user_rights:
+                        message = "📋 Список пользователей с правами пуст."
+                    else:
+                        message = "📋 Пользователи с правами:\n\n"
+                        for uid, rights in user_rights.items():
+                            role_type = rights.get('role', 'user')
+                            added_by = rights.get('added_by', 'система')
+                            added_date = rights.get('added_date', 'неизвестно')
+                            is_super = rights.get('is_super', False)
+                            super_mark = "👑 СУПЕР" if is_super else ""
+                            admin_mark = "👑" if role_type == 'admin' and not is_super else ""
+                            editor_mark = "✏️" if role_type == 'editor' else ""
+                            
+                            # Формируем ссылку на профиль VK
+                            vk_link = f"https://vk.com/id{uid}"
+                            
+                            message += f"{super_mark}{admin_mark}{editor_mark} ID: {uid}\n"
+                            message += f" Ссылка: {vk_link}\n"
+                            message += f" Роль: {role_type}\n"
+                            message += f" Добавил: {added_by}\n"
+                            message += f" Дата: {added_date}\n\n"
+
+                    send_message(message)
+
+                # Команда для просмотра суперадминов
+                elif text == '/superadmins':
+                    message = "👑 СУПЕРАДМИНЫ (нельзя отозвать права):\n\n"
+                    for admin_id in SUPER_ADMINS:
+                        vk_link = f"https://vk.com/id{admin_id}"
+                        message += f"• {admin_id} - {vk_link}\n"
+                    send_message(message)
+
+                # Команда помощи
+                elif text == '/help':
+                    help_text = ("📋 СИСТЕМА УПРАВЛЕНИЯ ПРАВАМИ\n\n"
+                                 "Для всех:\n"
+                                 "• /help - эта справка\n"
+                                 "• /myrights - мои права\n"
+                                 "• /superadmins - список суперадминов\n\n"
+                                 "Для редакторов (editor) и выше:\n"
+                                 "• /edit [строка/ник] [поле] [значение] - редактировать\n"
+                                 "• /search [запрос] - поиск администратора\n"
+                                 "• /stats - статистика\n"
+                                 "• /addadmin [ник] [дата] [VК] [форум] - добавить админа\n"
+                                 "• /lvlup [Ник] [lvl] [Дата] - повысить уровень\n\n"
+                                 "Для администраторов (admin) и выше:\n"
+                                 "• /unadmin [ник] - удалить строку администратора\n"
+                                 "• /grant [VК_ID] [роль] - выдать права (editor/admin)\n"
+                                 "• /revoke [VК_ID] - отозвать права\n"
+                                 "• /listusers - список пользователей с правами\n\n"
+                                 "Дополнительные команды:\n"
+                                 "• '+нг' - время до Нового года\n"
+                                 "• '+лето' - время до лета\n\n"
+                                 "Команда /lvlup:\n"
+                                 "• lvl может быть от 1 до 5\n"
+                                 "• Дата в формате ДД.ММ.ГГГГ\n"
+                                 "• Бот автоматически переставит строку выше строк с меньшим уровнем\n"
+                                 "• Применяет соответствующее цветовое форматирование и шрифт Comfortaa 11px (жирный)\n"
+                                 "• Сохраняет формулы в столбцах M и N\n"
+                                 "• Доступна редакторам и выше\n\n"
+                                 "Примеры:\n"
+                                 "• /addadmin Vasya 01.01.2024 https://vk.com/id1 https://forum.link\n"
+                                 "• /grant 123456789 editor\n"
+                                 "• /grant 987654321 admin\n"
+                                 "• /edit 5 Nick_Name НовоеИмя\n"
+                                 "• /edit Vasya Дата_назначения_1 15.02.2024\n"
+                                 "• /search Vasya\n"
+                                 "• /unadmin Vasya\n"
+                                 "• /lvlup Vasya 2 15.03.2024\n\n"
+                                 f"👑 Суперадмины (нельзя отозвать права): {', '.join(map(str, SUPER_ADMINS))}")
+                    send_message(help_text)
+
+                elif text.startswith('/'):
+                    send_message("❌ Неизвестная команда. Введите /help для списка команд.")
+
+    except Exception as e:
+        print(f"!!! КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        import traceback
+        traceback.print_exc()
+        time.sleep(5)
+
+if __name__ == '__main__':
+    main()
